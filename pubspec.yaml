@@ -1,0 +1,5 @@
+name: kdbxdart
+dependencies:
+  test: ^0.12.34
+  binary: "^0.1.3"
+  cryptoutils: "^0.3.0"
