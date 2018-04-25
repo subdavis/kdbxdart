@@ -1,1 +1,1 @@
-export 'src/chacha20.dart';
+export 'src/crypto/crypto.dart';

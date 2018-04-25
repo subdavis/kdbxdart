@@ -1,0 +1,265 @@
+// Written in 2013 by Dmitry Chestnykh.
+//
+// To the extent possible under law, the author have dedicated all copyright
+// and related and neighboring rights to this software to the public domain
+// worldwide. This software is distributed without any warranty.
+// http://creativecommons.org/publicdomain/zero/1.0/
+part of 'blake2';
+
+class BLAKE2s implements Blake2 {
+
+  final blockSize = 64;
+  final _blockSizeInWords = 16;
+
+  // Hash state.
+  List<int> _h; // chain
+  List<int> _t; // counter
+  List<int> _f; // finalization flags
+
+  List<int> _pendingData; // pending bytes
+  List<int> _currentBlockWords; // block words
+  List<int> _v; // temporary space for compression.
+
+  bool _digestCalled = false;
+
+  // Parameters.
+  int _digestLength;
+  List<int> _key;
+  List<int> _salt;
+  List<int> _person;
+  HashTreeConfig _tree;
+
+  int get digestLength => _digestLength;
+
+  // Helper methods.
+  _rotr32(x, n) => (x >> n) | ((x << (32 - n)) & _MASK_32);
+  _add32(x, y) => (x + y) & _MASK_32;
+
+  /**
+   *  Construct BLAKE2s hasher object, calculating hash of size [digestLength].
+   */
+  BLAKE2s({int digestLength : 32, List<int> key : null, List<int> salt : null,
+    List<int> person : null, HashTreeConfig tree : null}) {
+    _digestLength = digestLength;
+    _key = key;
+    _salt = salt;
+    _person = person;
+    _tree = tree;
+    _initialize();
+  }
+
+  _initialize() {
+    // Initialize state.
+    _h = _IV.sublist(0, _IV.length);
+    _t = [0, 0];
+    _f = [0, 0];
+    _v = new List.filled(_blockSizeInWords, 0);
+    _currentBlockWords = new List(_blockSizeInWords);
+    _pendingData = [];
+
+    if (_digestLength < 1 || _digestLength > 32) {
+      throw new ArgumentError('Wrong digest length');
+    }
+
+    var keyLength = _key == null ? 0 : _key.length;
+    if (keyLength > 32) {
+      throw new ArgumentError('Wrong key length');
+    }
+
+    var saltLength = _salt == null ? 0 : _salt.length;
+    if (saltLength > 0 && saltLength != 8) {
+      throw new ArgumentError('Wrong salt length');
+    }
+
+    var personLength = _person == null ? 0 : _person.length;
+    if (personLength > 0 && personLength != 8) {
+      throw new ArgumentError('Wrong personalization length');
+    }
+
+    // Create parameter block.
+    var parameterBlock = new List.filled(_h.length * _BYTES_PER_WORD, 0);
+    parameterBlock[0] = digestLength;
+    parameterBlock[1] = keyLength;
+    if (_salt != null) {
+      parameterBlock.setRange(16, 16+8, _salt, 0);
+    }
+    if (_person != null) {
+      parameterBlock.setRange(24, 24+8, _person, 0);
+    }
+    if (_tree != null) {
+      parameterBlock[2] = _tree.fanout;
+      parameterBlock[3] = _tree.maxDepth;
+
+      parameterBlock[4] = (_tree.leafSize >> 0) & _MASK_8;
+      parameterBlock[5] = (_tree.leafSize >> 8) & _MASK_8;
+      parameterBlock[6] = (_tree.leafSize >> 16) & _MASK_8;
+      parameterBlock[7] = (_tree.leafSize >> 24) & _MASK_8;
+
+      parameterBlock[8] = (_tree.nodeOffset >> 0) & _MASK_8;
+      parameterBlock[9] = (_tree.nodeOffset >> 8) & _MASK_8;
+      parameterBlock[10] = (_tree.nodeOffset >> 16) & _MASK_8;
+      parameterBlock[11] = (_tree.nodeOffset >> 24) & _MASK_8;
+      parameterBlock[12] = (_tree.nodeOffset >> 32) & _MASK_8;
+      parameterBlock[13] = (_tree.nodeOffset >> 40) & _MASK_8;
+
+      parameterBlock[14] = _tree.nodeDepth;
+      parameterBlock[15] = _tree.innerHashSize;
+    } else {
+      parameterBlock[2] = 1;
+      parameterBlock[3] = 1;
+    }
+
+    // XOR parameter block into initial chain value.
+    var paramWords = new List.filled(_h.length, 0);
+    _bytesToWords(parameterBlock, 0, paramWords, _h.length);
+
+    for (int i = 0; i < _h.length; i++) {
+      _h[i] ^= paramWords[i];
+    }
+
+    if (_key != null) {
+      // Process key.
+      var _paddedKey = new List.filled(blockSize, 0);
+      _paddedKey.setRange(0, keyLength, _key, 0);
+      add(_paddedKey);
+    }
+  }
+
+  BLAKE2s newInstance() {
+    return new BLAKE2s(
+        digestLength: _digestLength,
+        key: _key,
+        salt: _salt,
+        person: _person,
+        tree: _tree
+    );
+  }
+
+  BLAKE2s add(List<int> data) {
+    if (_digestCalled) {
+      throw new StateError('Hash add method called after close');
+    }
+    _pendingData.addAll(data);
+    _iterate();
+    return this;
+  }
+
+  _compressBlock() {
+    // Copy state.
+    _v.setRange(0, 8, _h);
+    // Copy constants.
+    _v.setRange(8, 16, _IV);
+    // XOR counter.
+    _v[12] ^= _t[0];
+    _v[13] ^= _t[1];
+    // XOR finalization flags.
+    _v[14] ^= _f[0];
+    _v[15] ^= _f[1];
+
+    // Rounds.
+    for (var round = 0; round < _ROUNDS; round++) {
+      _G(round, 0, 4,  8, 12,  0);
+      _G(round, 1, 5,  9, 13,  2);
+      _G(round, 2, 6, 10, 14,  4);
+      _G(round, 3, 7, 11, 15,  6);
+      _G(round, 3, 4,  9, 14, 14);
+      _G(round, 2, 7,  8, 13, 12);
+      _G(round, 0, 5, 10, 15,  8);
+      _G(round, 1, 6, 11, 12, 10);
+    }
+
+    // Feedforward.
+    for (var i = 0; i < 16; i++) {
+      _h[i % 8] ^= _v[i];
+    }
+  }
+ 
+  _G(r, a, b, c, d, e) {
+    _v[a] = _add32(_v[a], _add32(_currentBlockWords[_SIGMA[r][e]], _v[b]));
+    _v[d] = _rotr32(_v[d] ^ _v[a], 16);
+    _v[c] = _add32(_v[c], _v[d]);
+    _v[b] = _rotr32(_v[b] ^ _v[c], 12);
+    _v[a] = _add32(_v[a], _add32(_currentBlockWords[_SIGMA[r][e+1]], _v[b]));
+    _v[d] = _rotr32(_v[d] ^ _v[a], 8);
+    _v[c] = _add32(_v[c], _v[d]);
+    _v[b] = _rotr32(_v[b] ^ _v[c], 7);
+  }
+
+  _incrementCounter(int n) {
+    if (n == 0) return;
+    _t[0] = _add32(_t[0], n);
+    if (_t[0] < n) _t[1]++;
+  }
+
+  _iterate() {
+    var len = _pendingData.length;
+    if (len > blockSize) {
+      var index = 0;
+      for (; (len - index) > blockSize; index += blockSize) {
+        _bytesToWords(_pendingData, index, _currentBlockWords, _blockSizeInWords);
+        _incrementCounter(blockSize);
+        _compressBlock();
+      }
+      var remaining = len - index;
+      _pendingData = _pendingData.sublist(index, index + remaining);
+    }
+  }
+
+  _finalize() {
+    _incrementCounter(_pendingData.length);
+    // Pad with zeros.
+    var numberOfZeros = blockSize - _pendingData.length;
+    for (var i = 0; i < numberOfZeros; i++) {
+      _pendingData.add(0);
+    }
+    // Set finalization flags.
+    _f[0] = _MASK_32;
+    if (_tree != null && _tree.isLastNode) _f[1] = _MASK_32;
+
+    _bytesToWords(_pendingData, 0, _currentBlockWords, _blockSizeInWords);
+    _compressBlock();
+  }
+
+  // Compute the final result as a list of bytes from the hash words.
+  _resultAsBytes() {
+    var result = [];
+    for (var i = 0; i < _h.length; i++) {
+      result.addAll(_wordToBytes(_h[i]));
+    }
+    return result.sublist(0, _digestLength);
+  }
+
+  // Finish the hash computation and return the digest string.
+  List<int> close() {
+    if (_digestCalled) {
+      return _resultAsBytes();
+    }
+    _finalize();
+    _digestCalled = true;
+    return _resultAsBytes();
+  }
+
+  // Converts a list of bytes to a chunk of 32-bit words (little endian).
+  _bytesToWords(List<int> data, int dataIndex, List<int> words, int numWords) {
+    assert((data.length - dataIndex) >= (numWords * _BYTES_PER_WORD));
+
+    for (var wordIndex = 0; wordIndex < numWords; wordIndex++) {
+      words[wordIndex] =
+          ((data[dataIndex] & _MASK_8)) |
+          ((data[dataIndex + 1] & _MASK_8) << 8) |
+          ((data[dataIndex + 2] & _MASK_8) << 16) |
+          ((data[dataIndex + 3] & _MASK_8) << 24);
+      dataIndex += 4;
+    }
+  }
+
+  // Convert a 32-bit word to four bytes (little endian).
+  _wordToBytes(int word) {
+    List<int> bytes = new List(_BYTES_PER_WORD);
+    bytes[0] = (word >> 0) & _MASK_8;
+    bytes[1] = (word >> 8) & _MASK_8;
+    bytes[2] = (word >> 16) & _MASK_8;
+    bytes[3] = (word >> 24) & _MASK_8;
+    return bytes;
+  }
+}
